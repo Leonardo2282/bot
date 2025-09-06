@@ -1,465 +1,595 @@
 # app/bot.py
 import asyncio
-from typing import Dict, List, Tuple
+import json
+from typing import List, Mapping, Any
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InputMediaPhoto
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.filters import CommandStart
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    InlineQuery, InlineQueryResultPhoto, InputMediaPhoto
+)
 
 from .config import settings
 from . import db
-from .payments.cryptopay import create_deposit_invoice, rub_to_usdt, CryptoPayError
+from .payments import cryptopay
 
-bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+bot = Bot(settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# Один «экран» на чат: редактируем/заменяем одно сообщение
-SCREEN_MSG: Dict[int, int] = {}     # chat_id -> message_id
-STATE: Dict[int, str] = {}          # user_id -> "idle" | "await_bet_amount:<fight_id>:<side>" | "await_deposit_custom"
+AMOUNTS_USDT = [1, 2, 4, 8, 16, 32, 64, 128, 256]
 
-# ================= helpers =================
+# ===================== keyboards =====================
+def kb_main() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 События", callback_data="events")],
+        [InlineKeyboardButton(text="🎟 Текущие ставки", callback_data="mybets")],
+        [InlineKeyboardButton(text="📤 Поделиться ставкой", callback_data="share")],
+    ])
 
-async def ensure_user(x: Message | CallbackQuery) -> dict:
-    tg_id = x.from_user.id
-    username = x.from_user.username
-    row = await db.fetchrow("SELECT * FROM app_user WHERE tg_user_id=$1", tg_id)
-    if row:
-        return row
-    await db.execute(
-        "INSERT INTO app_user (tg_user_id, username) VALUES ($1,$2) ON CONFLICT (tg_user_id) DO NOTHING",
-        tg_id, username
-    )
-    return await db.fetchrow("SELECT * FROM app_user WHERE tg_user_id=$1", tg_id)
+def kb_fights_list(items: List[Mapping[str, Any]]) -> InlineKeyboardMarkup:
+    rows = []
+    for f in items[:]:
+        t = f"{f['participant1_name']} vs {f['participant2_name']}"
+        rows.append([InlineKeyboardButton(text=t, callback_data=f"fight:{f['id']}")])
+    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="back_main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-async def safe_edit_text(chat_id: int, text: str, reply_markup=None) -> None:
-    mid = SCREEN_MSG.get(chat_id)
-    if mid:
-        try:
-            await bot.edit_message_text(chat_id=chat_id, message_id=mid, text=text, reply_markup=reply_markup)
-            return
-        except Exception:
-            pass
-    m = await bot.send_message(chat_id, text, reply_markup=reply_markup)
-    SCREEN_MSG[chat_id] = m.message_id
+def kb_reply_link(deal_id: int, bot_username: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🤝 Ответить на ставку",
+            url=f"https://t.me/{bot_username}?start=reply_{deal_id}"
+        )]
+    ])
 
-async def safe_edit_photo(chat_id: int, photo_url: str, caption: str, reply_markup=None) -> None:
-    mid = SCREEN_MSG.get(chat_id)
-    if mid:
-        try:
-            await bot.edit_message_media(
-                chat_id=chat_id,
-                message_id=mid,
-                media=InputMediaPhoto(media=photo_url, caption=caption, parse_mode=ParseMode.HTML),
-                reply_markup=reply_markup
-            )
-            return
-        except Exception:
-            pass
-    m = await bot.send_photo(chat_id, photo=photo_url, caption=caption, reply_markup=reply_markup)
-    SCREEN_MSG[chat_id] = m.message_id
+def kb_fight(f: Mapping[str, Any]) -> InlineKeyboardMarkup:
+    p1 = f["participant1_name"]; p2 = f["participant2_name"]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Поставить на {p1}", callback_data=f"bet_side:{f['id']}:1")],
+        [InlineKeyboardButton(text=f"Поставить на {p2}", callback_data=f"bet_side:{f['id']}:2")],
+        [InlineKeyboardButton(text="📜 Открытые ставки", callback_data=f"open:{f['id']}")],
+        [InlineKeyboardButton(text="⬅️ К событиям", callback_data="events")],
+    ])
 
-def parse_money_to_cents(s: str) -> Tuple[bool, int | str]:
-    """
-    Возвращает (ok, cents|error_msg). Разрешаем '10', '10.5', '10,50'
-    Ограничиваем до 2 знаков после запятой.
-    """
-    txt = (s or "").strip().replace(" ", "").replace(",", ".")
+def kb_amounts(fid: int, side: int) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for i, amt in enumerate(AMOUNTS_USDT, start=1):
+        row.append(InlineKeyboardButton(text=f"{amt} USDT", callback_data=f"bet_amt:{fid}:{side}:{amt}"))
+        if i % 3 == 0:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"fight:{fid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_open_deals(fight_id: int, deals: List[Mapping[str, Any]]) -> InlineKeyboardMarkup:
+    rows = []
+    for d in deals[:20]:
+        side = d["participant1"]; amt = d["amount1_cents"] / 100
+        rows.append([InlineKeyboardButton(
+            text=f"Ответить: {amt:.2f} USDT (на {'P2' if side==1 else 'P1'})",
+            callback_data=f"reply:{d['id']}"
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"fight:{fight_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_pay(url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Оплатить в Mini App", url=url)],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_main")],
+    ])
+
+def kb_reply_one(deal_id: int, label: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=label, callback_data=f"reply:{deal_id}")],
+    ])
+
+def kb_share_pick_chat(deal_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Отправить другу", switch_inline_query=f"reply_{deal_id}")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_main")],
+    ])
+
+# ===================== helpers =====================
+async def ensure_user(tg_user) -> Mapping[str, Any]:
+    return await db.ensure_user_by_tg(tg_user.id, tg_user.username or tg_user.full_name)
+
+def fight_caption(f: Mapping[str, Any]) -> str:
+    lines = [f"<b>{f['title']}</b>", f"{f['participant1_name']} vs {f['participant2_name']}"]
+    if f.get("starts_at"): lines.append(f"Старт: {f['starts_at']}")
+    if f.get("description"): lines += ["", f"{f['description']}"]
+    return "\n".join(lines)
+
+async def replace(cq: CallbackQuery, text: str, reply_markup: InlineKeyboardMarkup):
     try:
-        val = float(txt)
+        await cq.message.delete()
     except Exception:
-        return False, "Некорректный формат. Пример: 10 или 10.5"
-    if val <= 0:
-        return False, "Сумма должна быть больше нуля."
-    # максимум 2 знака
-    if "." in txt:
-        frac = txt.split(".", 1)[1]
-        if len(frac) > 2:
-            return False, "Не больше 2 знаков после запятой."
-    cents = int(round(val * 100))
-    if cents == 0:
-        return False, "Слишком маленькая сумма."
-    if cents > 10_000_000_00:  # 10 млн USDT (защита от опечаток)
-        return False, "Слишком большая сумма."
-    return True, cents
+        pass
+    await cq.message.answer(text, reply_markup=reply_markup)
+# === helpers (добавь рядом с show_main/replace) ===
+async def send_with_photo(target_msg_or_chat, photo_url: str, caption: str, reply_markup: InlineKeyboardMarkup):
+    """
+    Универсально отправляет фото+подпись.
+    target_msg_or_chat: Message (для .answer_*) или сам Bot/ChatId — мы используем Message.
+    """
+    try:
+        await target_msg_or_chat.answer_photo(photo=photo_url, caption=caption, reply_markup=reply_markup)
+    except Exception:
+        # если вдруг фото битое — просто текстом
+        await target_msg_or_chat.answer(caption, reply_markup=reply_markup)
 
-# ================= keyboards =================
+from aiogram.types import InputMediaPhoto, InlineKeyboardMarkup
 
-def main_menu_kb():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📅 События", callback_data="menu:events")
-    kb.button(text="💼 Мои ставки", callback_data="menu:mybets")
-    kb.button(text="💰 Баланс", callback_data="menu:balance")
-    kb.button(text="➕ Пополнить", callback_data="menu:deposit")
-    kb.button(text="⬅️ Вывести", callback_data="menu:withdraw")
-    kb.adjust(2, 2, 1)
-    return kb.as_markup()
+async def replace_with_photo(
+    cq: CallbackQuery,
+    photo_url: str,
+    caption: str,
+    reply_markup: InlineKeyboardMarkup | None = None
+):
+    # безопасная замена: удаляем старое сообщение и отправляем новое фото
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+    await cq.message.answer_photo(photo=photo_url, caption=caption, reply_markup=reply_markup)
 
-def events_kb(rows: List[dict]):
-    kb = InlineKeyboardBuilder()
-    for r in rows:
-        title = f"{r['participant1_name']} vs {r['participant2_name']} — {r['starts_at'].strftime('%d.%m %H:%M') if r.get('starts_at') else ''}"
-        kb.button(text=title, callback_data=f"fight:{r['id']}")
-    kb.button(text="◀️ Назад", callback_data="menu:root")
-    kb.adjust(1)
-    return kb.as_markup()
+async def show_main(target_msg: Message):
+    photo = getattr(settings, "MAIN_MENU_PHOTO_URL", None)
+    if photo:
+        await send_with_photo(target_msg, photo, "Главное меню:", kb_main())
+    else:
+        await target_msg.answer("Главное меню:", reply_markup=kb_main())
 
-def fight_card_kb(fight_id: int):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Поставить на 1-го", callback_data=f"side:{fight_id}:1")
-    kb.button(text="Поставить на 2-го", callback_data=f"side:{fight_id}:2")
-    kb.button(text="◀️ К событиям", callback_data="menu:events")
-    kb.adjust(1, 1, 1)
-    return kb.as_markup()
+async def auto_check_and_finalize(cq: CallbackQuery, invoice_id: int):
+    """
+    30 сек, шаг 2 сек, опрашиваем CryptoPay. На paid — проводим NEW/MATCH и правим то же сообщение.
+    Если не успели — показываем кнопки ручной проверки.
+    """
+    for _ in range(15):  # ~30 сек
+        try:
+            invs = await cryptopay.get_invoices([invoice_id])
+            inv = next((x for x in invs if int(x.get("invoice_id", 0)) == invoice_id), None)
+        except Exception:
+            inv = None
 
-def open_bets_kb(bets: List[dict], fight_id: int, side: int):
-    kb = InlineKeyboardBuilder()
-    for b in bets:
-        amount = b["amount1_cents"] / 100
-        kb.button(text=f"Принять {amount:.2f} USDT (id={b['id']})", callback_data=f"accept:{b['id']}")
-    kb.button(text="💸 Создать свою ставку", callback_data=f"create_bet:{fight_id}:{side}")
-    kb.button(text="◀️ Назад", callback_data=f"fight:{fight_id}")
-    kb.adjust(1)
-    return kb.as_markup()
+        if inv and inv.get("status") == "paid":
+            iw = await db.get_invoice_wait(invoice_id)
+            text = "Оплата уже обработана ✅."
+            if iw:
+                payload = json.loads(iw["payload"])
+                payer_tg = int(payload.get("tg_user_id"))
+                user = await db.ensure_user_by_tg(payer_tg, None)
 
-def bet_enter_amount_kb(fight_id: int, side: int):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="◀️ Назад", callback_data=f"bet:cancel:{fight_id}:{side}")
-    return kb.as_markup()
+                if iw["kind"] == "NEW":
+                    await db.create_deal_after_paid(payload, invoice_id, user["id"])
+                    text = "✅ Оплата получена. Ставка активна и ждёт соперника."
+                elif iw["kind"] == "MATCH":
+                    await db.match_deal_after_paid(payload, invoice_id, user["id"])
+                    text = "✅ Оплата получена. Ставка сматчена!"
 
-def deposit_rub_menu_kb():
-    amounts = [25, 50, 100, 300, 500, 1000, 3000, 5000, 10000]
-    kb = InlineKeyboardBuilder()
-    for a in amounts:
-        kb.button(text=f"{a} ₽", callback_data=f"deposit_rub:{a}")
-    kb.button(text="◀️ Назад", callback_data="menu:root")
-    kb.adjust(3, 3, 3, 1)
-    return kb.as_markup()
+                await db.del_invoice_wait(invoice_id)
 
-def pay_usdt_kb(invoice_url: str):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Оплатить в USDT (CryptoBot)", url=invoice_url)
-    kb.button(text="◀️ В меню", callback_data="menu:root")
-    kb.adjust(1, 1)
-    return kb.as_markup()
+            try:
+                if cq.message:
+                    await cq.message.edit_text(text, reply_markup=kb_main())
+                else:
+                    await bot.edit_message_caption(
+                        inline_message_id=cq.inline_message_id,
+                        caption=text,
+                        reply_markup=kb_main(),
+                        parse_mode=ParseMode.HTML
+                    )
+            except Exception:
+                pass
+            return
 
-# ================= texts =================
+        await asyncio.sleep(2)
 
-def fight_caption(f: dict) -> str:
-    return (
-        f"<b>{f['participant1_name']} vs {f['participant2_name']}</b>\n"
-        f"Старт: {f['starts_at'].strftime('%d.%m %H:%M') if f.get('starts_at') else '—'}\n"
-        f"Статус: {f.get('status','upcoming')}"
-    )
+    # таймаут — оставить кнопки «Проверить оплату»
+    rm = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"checkpay:{invoice_id}")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_main")],
+    ])
+    try:
+        if cq.message:
+            await cq.message.edit_reply_markup(reply_markup=rm)
+        else:
+            await bot.edit_message_reply_markup(inline_message_id=cq.inline_message_id, reply_markup=rm)
+    except Exception:
+        pass
 
-# ================= screens =================
+# ===================== handlers =====================
+# вверху файла
+import re
+REPLY_RE = re.compile(r"(?:^|[\s?=&])reply_(\d+)\b", re.IGNORECASE)
 
-async def screen_root(chat_id: int):
-    await safe_edit_text(chat_id, "Главное меню:", reply_markup=main_menu_kb())
+@dp.message(CommandStart())
+async def start(m: Message):
+    await ensure_user(m.from_user)
 
-async def screen_events(chat_id: int):
-    rows = await db.fetch("""SELECT * FROM fight
-                             WHERE status IN ('upcoming','today','live')
-                             ORDER BY starts_at NULLS LAST, id""")
-    if not rows:
-        await safe_edit_text(chat_id, "Пока нет событий (таблица пустая или синк не прошёл).",
-                             reply_markup=main_menu_kb())
+    raw = m.text or ""
+    compact = " ".join(raw.split())                  # убираем \n и лишние пробелы
+    mobj = REPLY_RE.search(compact)                  # ловим reply_<id> в ЛЮБОЙ форме
+
+    if not mobj:
+        await show_main(m)                           # твоя функция главного меню
         return
-    await safe_edit_text(chat_id, "Выбери событие:", reply_markup=events_kb(rows))
 
-async def screen_balance(chat_id: int, user: dict):
-    await safe_edit_text(
-        chat_id,
-        f"Баланс: <b>{user['balance_cents']/100:.2f}</b> USDT, заморожено: <b>{user['held_cents']/100:.2f}</b>",
-        reply_markup=main_menu_kb()
-    )
-
-async def screen_mybets(chat_id: int, user: dict):
-    rows = await db.fetch(
-        """SELECT d.*, f.participant1_name, f.participant2_name
-           FROM deal d
-           JOIN fight f ON f.id=d.fight_id
-           WHERE d.user1_id=$1 OR d.user2_id=$1
-           ORDER BY d.id DESC LIMIT 10""",
-        user["id"]
-    )
-    if not rows:
-        await safe_edit_text(chat_id, "Пока нет ставок.", reply_markup=main_menu_kb())
+    try:
+        deal_id = int(mobj.group(1))
+    except Exception:
+        await show_main(m)
         return
-    lines = []
-    for r in rows:
-        a = r["amount1_cents"]/100
-        status = "ожидает оппонента" if r["user2_id"] is None else "схлопнута"
-        lines.append(f"{r['participant1_name']} vs {r['participant2_name']}: {a:.2f} USDT ({status})")
-    await safe_edit_text(chat_id, "Мои ставки:\n\n" + "\n".join(lines), reply_markup=main_menu_kb())
 
-async def screen_fight(chat_id: int, fight_id: int):
-    f = await db.fetchrow("SELECT * FROM fight WHERE id=$1", fight_id)
-    if not f:
-        await safe_edit_text(chat_id, "Событие не найдено.", reply_markup=main_menu_kb()); return
-    photo = f.get("photo_url") or "https://picsum.photos/seed/placeholder/1200/700"
-    await safe_edit_photo(chat_id, photo, fight_caption(f), reply_markup=fight_card_kb(fight_id))
+    u = await ensure_user(m.from_user)
+    d = await db.fetchrow("""
+        SELECT d.*, f.title, f.participant1_name p1, f.participant2_name p2, f.photo_url
+        FROM deal d JOIN fight f ON f.id=d.fight_id
+        WHERE d.id=$1
+    """, deal_id)
 
-async def screen_side(chat_id: int, fight_id: int, side: int):
-    f = await db.fetchrow("SELECT * FROM fight WHERE id=$1", fight_id)
-    if not f:
-        await safe_edit_text(chat_id, "Событие не найдено.", reply_markup=main_menu_kb()); return
-    bets = await db.fetch(
-        """SELECT d.* FROM deal d
-           WHERE d.fight_id=$1 AND d.user2_id IS NULL AND d.participant1=$2
-           ORDER BY d.amount1_cents ASC, d.id""",
-        fight_id, side
-    )
-    if not bets:
-        txt = (f"{fight_caption(f)}\n\n"
-               f"Открытых ставок на {'1-го' if side==1 else '2-го'} пока нет.\n"
-               f"Нажми «Создать свою ставку».")
-        await safe_edit_text(chat_id, txt, reply_markup=open_bets_kb([], fight_id, side))
-        return
-    txt = (f"{fight_caption(f)}\n\n"
-           f"Выбери открытую ставку на {'1-го' if side==1 else '2-го'} или создай свою:")
-    await safe_edit_text(chat_id, txt, reply_markup=open_bets_kb(bets, fight_id, side))
+    if (not d) or (not d["paid1"]) or d["status"] != "awaiting_match":
+        await m.answer("Эта ставка уже недоступна.", reply_markup=kb_main()); return
+    if d["user1_id"] == u["id"]:
+        await m.answer("Нельзя отвечать на свою ставку. Отправь её другу через «📤 Поделиться ставкой».",
+                       reply_markup=kb_main()); return
 
-# ================= commands =================
+    need_side = 2 if d["participant1"] == 1 else 1
+    amt = (d["amount1_cents"] or 0) / 100
+    text = (f"<b>{d['title']}</b>\n{d['p1']} vs {d['p2']}\n\n"
+            f"Ставка друга: <b>{amt:.2f} USDT</b>\n"
+            f"Нужно поставить на: <b>{'P1' if need_side == 1 else 'P2'}</b>")
 
-@dp.message(Command("start"))
-async def start_cmd(m: Message):
-    STATE[m.from_user.id] = "idle"
-    await ensure_user(m)
-    await screen_root(m.chat.id)
+    if d.get("photo_url"):
+        await m.answer_photo(d["photo_url"], caption=text,
+                             reply_markup=kb_reply_one(deal_id, "🤝 Ответить на ставку"))
+    else:
+        await m.answer(text, reply_markup=kb_reply_one(deal_id, "🤝 Ответить на ставку"))
 
-# ================= callbacks =================
+@dp.callback_query(F.data == "back_main")
+async def back_main(cq: CallbackQuery):
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+    await show_main(cq.message)   # покажет главное меню с обложкой
 
-@dp.callback_query(F.data == "menu:root")
-async def cb_root(cq: CallbackQuery):
-    STATE[cq.from_user.id] = "idle"
-    await cq.answer()
-    await screen_root(cq.message.chat.id)
-
-@dp.callback_query(F.data == "menu:events")
+@dp.callback_query(F.data == "events")
 async def cb_events(cq: CallbackQuery):
-    await cq.answer()
-    await screen_events(cq.message.chat.id)
+    items = await db.list_upcoming()
+    events_photo = getattr(settings, "EVENTS_MENU_PHOTO_URL", None)
 
-@dp.callback_query(F.data == "menu:balance")
-async def cb_balance(cq: CallbackQuery):
-    await cq.answer()
-    user = await ensure_user(cq)
-    await screen_balance(cq.message.chat.id, user)
-
-@dp.callback_query(F.data == "menu:mybets")
-async def cb_mybets(cq: CallbackQuery):
-    await cq.answer()
-    user = await ensure_user(cq)
-    await screen_mybets(cq.message.chat.id, user)
-
-@dp.callback_query(F.data == "menu:withdraw")
-async def cb_withdraw(cq: CallbackQuery):
-    await cq.answer("Вывод — пока заглушка.", show_alert=True)
-
-# --- Пополнение (RUB -> USDT по курсу CryptoPay) ---
-
-@dp.callback_query(F.data == "menu:deposit")
-async def cb_deposit(cq: CallbackQuery):
-    await cq.answer()
-    await safe_edit_text(
-        cq.message.chat.id,
-        "Выбери сумму пополнения в ₽:",
-        reply_markup=deposit_rub_menu_kb()
-    )
-
-@dp.callback_query(F.data.startswith("deposit_rub:"))
-async def cb_deposit_rub(cq: CallbackQuery):
-    await cq.answer()
-    rub = float(cq.data.split(":")[1])
-    user = await ensure_user(cq)
-    try:
-        usdt = await rub_to_usdt(rub)
-    except CryptoPayError as e:
-        await safe_edit_text(
-            cq.message.chat.id,
-            f"Не удалось получить курс у Crypto Pay. Попробуй позже.\n\n{e}",
-            reply_markup=main_menu_kb()
-        )
-        return
-    try:
-        invoice = await create_deposit_invoice(user_id=user["id"], amount_usdt=usdt)
-    except CryptoPayError as e:
-        await safe_edit_text(
-            cq.message.chat.id,
-            f"Не удалось создать счёт на оплату. Попробуй позже.\n\n{e}",
-            reply_markup=main_menu_kb()
-        )
+    if not items:
+        caption = "Пока нет событий."
+        if events_photo:
+            await replace_with_photo(cq, events_photo, caption, kb_main())
+        else:
+            await replace(cq, caption, kb_main())
         return
 
-    txt = (
-        f"Пополнение баланса на <b>{int(rub)} ₽</b>\n"
-        f"≈ <b>{usdt:.2f} USDT</b> по текущему курсу Crypto Pay.\n\n"
-        f"Нажми кнопку ниже, чтобы оплатить через мини-приложение CryptoBot."
+    caption = "Выбери событие:"
+    markup = kb_fights_list(items)
+    if events_photo:
+        await replace_with_photo(cq, events_photo, caption, markup)
+    else:
+        await replace(cq, caption, markup)
+
+
+
+@dp.callback_query(F.data.startswith("open:"))
+async def cb_open(cq: CallbackQuery):
+    fight_id = int(cq.data.split(":")[1])
+    u = await ensure_user(cq.from_user)
+    deals = await db.list_open_deals(fight_id, exclude_user_id=u["id"])
+    if not deals:
+        f = await db.get_fight(fight_id)
+        return await replace(cq, "Открытых ставок нет.\nСоздай свою:", InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"Поставить на {f['participant1_name']}", callback_data=f"bet_side:{fight_id}:1")],
+            [InlineKeyboardButton(text=f"Поставить на {f['participant2_name']}", callback_data=f"bet_side:{fight_id}:2")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"fight:{fight_id}")],
+        ]))
+    await replace(cq, "Открытые ставки:", kb_open_deals(fight_id, deals))
+
+@dp.callback_query(F.data.startswith("bet_side:"))
+async def cb_side(cq: CallbackQuery):
+    _, fid, side = cq.data.split(":")
+    await replace(cq, "Выбери сумму:", kb_amounts(int(fid), int(side)))
+
+@dp.callback_query(F.data.startswith("bet_amt:"))
+async def cb_amount(cq: CallbackQuery):
+    _, fid, side, amt = cq.data.split(":")
+    fight_id, participant, amount = int(fid), int(side), int(amt)
+    await ensure_user(cq.from_user)
+
+    payload = {
+        "kind": "NEW",
+        "fight_id": fight_id,
+        "participant": participant,
+        "amount_cents": amount * 100,
+        "tg_user_id": cq.from_user.id,
+    }
+
+    inv = await cryptopay.create_invoice(
+        amount_cents=amount * 100,
+        asset=settings.CRYPTO_DEFAULT_ASSET,
+        payload=json.dumps(payload),
     )
-    await safe_edit_text(
-        cq.message.chat.id,
-        txt,
-        reply_markup=pay_usdt_kb(invoice["bot_invoice_url"])
+    invoice_id = int(inv["invoice_id"])
+    await db.add_invoice_wait(invoice_id, "NEW", payload)
+
+    pay_url = inv.get("bot_invoice_url") or inv.get("pay_url") or inv.get("url")
+    await cq.message.edit_text(
+        f"Создан счёт на оплату: <b>{amount} USDT</b>\n"
+        "После оплаты ставка активируется и будет ждать оппонента до окончания боя.",
+        reply_markup=kb_pay(pay_url)
     )
 
-# --- Бои / ставки ---
+    # авто-проверка этой же карточки
+    asyncio.create_task(auto_check_and_finalize(cq, invoice_id))
 
 @dp.callback_query(F.data.startswith("fight:"))
 async def cb_fight(cq: CallbackQuery):
-    await cq.answer()
-    fight_id = int(cq.data.split(":")[1])
-    STATE[cq.from_user.id] = "idle"
-    await screen_fight(cq.message.chat.id, fight_id)
-
-@dp.callback_query(F.data.startswith("side:"))
-async def cb_side(cq: CallbackQuery):
-    await cq.answer()
-    fight_id, side = map(int, cq.data.split(":")[1:])
-    STATE[cq.from_user.id] = "idle"
-    await screen_side(cq.message.chat.id, fight_id, side)
-
-@dp.callback_query(F.data.startswith("create_bet:"))
-async def cb_create_bet(cq: CallbackQuery):
-    await cq.answer()
-    fight_id, side = map(int, cq.data.split(":")[1:])
-    STATE[cq.from_user.id] = f"await_bet_amount:{fight_id}:{side}"
-    await safe_edit_text(
-        cq.message.chat.id,
-        "Введи сумму ставки (USDT), например: <b>10</b> или <b>10.5</b>",
-        reply_markup=bet_enter_amount_kb(fight_id, side)
-    )
-
-@dp.callback_query(F.data.startswith("bet:cancel:"))
-async def cb_bet_cancel(cq: CallbackQuery):
-    # Возврат к экрану выбора ставок на сторону
-    await cq.answer()
-    st = STATE.get(cq.from_user.id, "idle")
-    _, _, fight_id, side = cq.data.split(":")
-    fight_id = int(fight_id); side = int(side)
-    STATE[cq.from_user.id] = "idle"
-    await screen_side(cq.message.chat.id, fight_id, side)
-
-@dp.callback_query(F.data.startswith("accept:"))
-async def cb_accept(cq: CallbackQuery):
-    await cq.answer()
-    deal_id = int(cq.data.split(":")[1])
-    deal = await db.fetchrow("SELECT * FROM deal WHERE id=$1", deal_id)
-    if not deal or deal["user2_id"] is not None:
-        await safe_edit_text(cq.message.chat.id, "Ставка уже недоступна.", reply_markup=main_menu_kb()); return
-    me = await ensure_user(cq)
-    if deal["user1_id"] == me["id"]:
-        await safe_edit_text(cq.message.chat.id, "Нельзя принять собственную ставку.", reply_markup=main_menu_kb()); return
-
-    need = deal["amount1_cents"]
-    if me["balance_cents"] < need:
-        await safe_edit_text(cq.message.chat.id, f"Недостаточно средств. Нужно {need/100:.2f} USDT. Пополни баланс.",
-                             reply_markup=main_menu_kb()); return
-
-    async with (await db.get_pool()).acquire() as conn:
-        tr = conn.transaction(); await tr.start()
-        try:
-            fresh = await conn.fetchrow("SELECT * FROM deal WHERE id=$1 FOR UPDATE", deal_id)
-            if not fresh or fresh["user2_id"] is not None:
-                await tr.rollback()
-                await safe_edit_text(cq.message.chat.id, "Ставку только что забрали.", reply_markup=main_menu_kb()); return
-            await conn.execute(
-                "UPDATE deal SET user2_id=$1, amount2_cents=$2, participant2=$3, matched_at=now() WHERE id=$4",
-                me["id"], fresh["amount1_cents"], (2 if fresh["participant1"] == 1 else 1), deal_id
-            )
-            await conn.execute(
-                "UPDATE app_user SET balance_cents=balance_cents-$1, held_cents=held_cents+$1 WHERE id=$2",
-                need, me["id"]
-            )
-            await conn.execute(
-                "INSERT INTO ledger (user_id, kind, amount_cents, ref_deal_id) VALUES ($1,'bet_hold',$2,$3)",
-                me["id"], -need, deal_id
-            )
-            await tr.commit()
-        except Exception:
-            await tr.rollback()
-            raise
-
-    await safe_edit_text(cq.message.chat.id, f"Ты принял ставку (id={deal_id}) на {need/100:.2f} USDT. Ждём результат боя.",
-                         reply_markup=main_menu_kb())
-
-# ================= text input =================
-
-@dp.message(F.text)
-async def on_text(m: Message):
-    user = await ensure_user(m)
-    st = STATE.get(m.from_user.id, "idle")
-
-    # --- ожидаем сумму ставки ---
-    if st.startswith("await_bet_amount:"):
-        _, fight_id, side = st.split(":"); fight_id = int(fight_id); side = int(side)
-
-        ok, res = parse_money_to_cents(m.text)
-        if not ok:
-            await safe_edit_text(
-                m.chat.id,
-                f"Ошибка: {res}\n\nВведи сумму ставки (USDT), например: <b>10</b> или <b>10.5</b>",
-                reply_markup=bet_enter_amount_kb(fight_id, side)
-            )
-            return
-        cents = int(res)
-
-        # баланс
-        fresh_user = await db.fetchrow("SELECT id, balance_cents FROM app_user WHERE id=$1", user["id"])
-        if fresh_user["balance_cents"] < cents:
-            await safe_edit_text(
-                m.chat.id,
-                f"Недостаточно средств. Баланс: {fresh_user['balance_cents']/100:.2f} USDT.",
-                reply_markup=main_menu_kb()
-            )
-            STATE[m.from_user.id] = "idle"
-            return
-
-        # создаём ставку и замораживаем
-        async with (await db.get_pool()).acquire() as conn:
-            tr = conn.transaction(); await tr.start()
-            try:
-                await conn.execute(
-                    "INSERT INTO deal (fight_id, user1_id, participant1, amount1_cents) VALUES ($1,$2,$3,$4)",
-                    fight_id, user["id"], side, cents
-                )
-                await conn.execute(
-                    "UPDATE app_user SET balance_cents=balance_cents-$1, held_cents=held_cents+$1 WHERE id=$2",
-                    cents, user["id"]
-                )
-                await conn.execute(
-                    "INSERT INTO ledger (user_id, kind, amount_cents) VALUES ($1,'bet_hold',$2)",
-                    user["id"], -cents
-                )
-                await tr.commit()
-            except Exception:
-                await tr.rollback()
-                raise
-
-        STATE[m.from_user.id] = "idle"
-        await safe_edit_text(
-            m.chat.id,
-            f"Ставка на <b>{cents/100:.2f} USDT</b> создана. Ждём оппонента.",
-            reply_markup=main_menu_kb()
-        )
+    fid = int(cq.data.split(":")[1])
+    f = await db.get_fight(fid)
+    if not f:
+        await cq.answer("Событие не найдено", show_alert=True)
         return
 
-    # --- любой другой текст в idle ---
-    await safe_edit_text(m.chat.id, "Извините, я не знаю такой команды.", reply_markup=main_menu_kb())
+    # пробуем отредактировать фото, если исходное сообщение — фото
+    if f.get("photo_url"):
+        try:
+            await cq.message.edit_media(
+                InputMediaPhoto(media=f["photo_url"], caption=fight_caption(f)),
+                reply_markup=kb_fight(f)
+            )
+            return
+        except Exception:
+            # не получилось редактировать (или исходное сообщение не фото) — просто заменим
+            pass
 
-# ================= run =================
+    await replace(cq, fight_caption(f), kb_fight(f))
+
+@dp.callback_query(F.data.startswith("reply:"))
+async def cb_reply(cq: CallbackQuery):
+    deal_id = int(cq.data.split(":")[1])
+    u = await ensure_user(cq.from_user)
+    d = await db.fetchrow("""SELECT d.*, f.participant1_name p1, f.participant2_name p2
+                               FROM deal d JOIN fight f ON f.id=d.fight_id
+                              WHERE d.id=$1""", deal_id)
+    if not d or not d["paid1"] or d["status"] != "awaiting_match":
+        return await cq.answer("Эта ставка уже недоступна.", show_alert=True)
+    if d["user1_id"] == u["id"]:
+        return await cq.answer("Нельзя отвечать на свою ставку.", show_alert=True)
+
+    resp_side = 2 if d["participant1"] == 1 else 1
+    amt_cents = int(d["amount1_cents"])
+    payload = {"kind": "MATCH", "deal_id": deal_id, "participant": resp_side,
+               "amount_cents": amt_cents, "tg_user_id": cq.from_user.id}
+
+    inv = await cryptopay.create_invoice(
+        amount_cents=amt_cents,
+        asset=settings.CRYPTO_DEFAULT_ASSET,
+        payload=json.dumps(payload)
+    )
+    invoice_id = int(inv["invoice_id"])
+    await db.add_invoice_wait(invoice_id, "MATCH", payload)
+    pay_url = inv.get("bot_invoice_url") or inv.get("pay_url") or inv.get("url")
+
+    # ВАЖНО: редактируем текущее сообщение (не delete+answer), чтобы авто-проверка могла его обновить
+    await cq.message.edit_text(
+        f"Счёт на <b>{amt_cents / 100:.2f} USDT</b> создан. После оплаты ставка будет сматчена.",
+        reply_markup=kb_pay(pay_url),
+    )
+
+    asyncio.create_task(auto_check_and_finalize(cq, invoice_id))
+
+@dp.callback_query(F.data == "mybets")
+async def cb_mybets(cq: CallbackQuery):
+    u = await ensure_user(cq.from_user)
+
+    rows = await db.fetch("""
+        SELECT d.*,
+               f.title,
+               f.participant1_name AS p1,
+               f.participant2_name AS p2,
+               f.status AS fight_status
+        FROM deal d
+        JOIN fight f ON f.id = d.fight_id
+        WHERE (d.user1_id = $1 OR d.user2_id = $1)
+          AND f.status IN ('upcoming','today','live')
+          AND d.status IN ('awaiting_match','matched')
+        ORDER BY d.id DESC
+        LIMIT 100
+    """, u["id"])
+
+    if not rows:
+        await replace(cq, "Сейчас у тебя нет актуальных ставок.", kb_main())
+        return
+
+    lines = []
+    for b in rows:
+        who = "P1" if b["user1_id"] == u["id"] else ("P2" if b["user2_id"] == u["id"] else "?")
+        side = b["participant1"] if who == "P1" else b.get("participant2")
+        side_txt = "на 1-го" if side == 1 else "на 2-го"
+        amt = (b["amount1_cents"] if who == "P1" else (b["amount2_cents"] or 0)) / 100
+        status_human = "ждёт оппонента" if b["status"] == "awaiting_match" else "сматчена"
+        lines.append(f"• <b>{b['title']}</b> — {side_txt} — {amt:.2f} {settings.CRYPTO_DEFAULT_ASSET} — {status_human}")
+
+    await replace(cq, "\n".join(lines), kb_main())
+
+@dp.callback_query(F.data == "share")
+async def cb_share(cq: CallbackQuery):
+    u = await ensure_user(cq.from_user)
+
+    sql = """
+    SELECT
+        d.id,
+        d.amount1_cents,
+        d.participant1,
+        f.title,
+        f.participant1_name AS p1,
+        f.participant2_name AS p2
+    FROM deal AS d
+    JOIN fight AS f ON f.id = d.fight_id
+    WHERE d.user1_id = $1
+      AND d.status = 'awaiting_match'
+      AND d.paid1 = TRUE
+      AND d.user2_id IS NULL
+    ORDER BY d.id DESC
+    LIMIT 20
+    """
+
+    try:
+        rows = await db.fetch(sql, u["id"])
+    except Exception as e:
+        # временный лог — если вдруг опять что-то с SQL
+        await cq.answer(f"Ошибка выборки: {type(e).__name__}", show_alert=True)
+        return
+
+    if not rows:
+        await replace(cq, "Нет открытых ставок для шаринга. Создай новую ставку.", kb_main())
+        return
+
+    kb_rows = []
+    for r in rows:
+        amt = (r["amount1_cents"] or 0) / 100
+        fighter = r["p1"] if int(r["participant1"]) == 1 else r["p2"]
+        kb_rows.append([
+            InlineKeyboardButton(
+                text=f"📤 {fighter} • {amt:.2f} USDT",
+                callback_data=f"sharedeal:{r['id']}"
+            )
+        ])
+
+    kb_rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="back_main")])
+    await replace(cq, "Выбери ставку для отправки другу:", InlineKeyboardMarkup(inline_keyboard=kb_rows))
+
+@dp.callback_query(F.data.startswith("sharedeal:"))
+async def cb_sharedeal(cq: CallbackQuery):
+    deal_id = int(cq.data.split(":")[1])
+
+    # нормальный SQL без "..."
+    sql = """
+    SELECT
+        d.*,
+        f.title,
+        f.photo_url,
+        f.participant1_name AS p1,
+        f.participant2_name AS p2
+    FROM deal AS d
+    JOIN fight AS f ON f.id = d.fight_id
+    WHERE d.id = $1
+    """
+    d = await db.fetchrow(sql, deal_id)
+
+    if (not d) or (not d["paid1"]) or d["status"] != "awaiting_match":
+        await cq.answer("Эта ставка уже недоступна к пересылке.", show_alert=True)
+        return
+
+    # показываем экран «Отправить другу»
+    photo = getattr(settings, "MAIN_MENU_PHOTO_URL", None)
+    caption = "Нажми «Отправить другу», выбери чат и отправь карточку:"
+    markup = kb_share_pick_chat(deal_id)
+
+    if photo:
+        await replace_with_photo(cq, photo, caption, markup)
+    else:
+        await replace(cq, caption, markup)
+
+@dp.inline_query()
+async def inline_share(iq: InlineQuery):
+    q = (iq.query or "").strip()
+    if not q.startswith("reply_"):
+        return await bot.answer_inline_query(iq.id, [], cache_time=1, is_personal=True)
+
+    try:
+        deal_id = int(q.split("_", 1)[1])
+    except Exception:
+        return await bot.answer_inline_query(iq.id, [], cache_time=1, is_personal=True)
+
+    d = await db.fetchrow("""
+        SELECT d.*,
+               f.title,
+               f.participant1_name AS p1,
+               f.participant2_name AS p2,
+               f.photo_url
+        FROM deal d
+        JOIN fight f ON f.id = d.fight_id
+        WHERE d.id = $1
+    """, deal_id)
+    if not d or not d["paid1"] or d["status"] != "awaiting_match":
+        return await bot.answer_inline_query(iq.id, [], cache_time=1, is_personal=True)
+
+    need_side   = 2 if d["participant1"] == 1 else 1
+    amt         = (d["amount1_cents"] or 0) / 100
+    picked_name = d["p1"] if d["participant1"] == 1 else d["p2"]
+
+    caption = (
+        f"<b>Ставка на {picked_name}</b>\n"
+        f"{d['p1']} vs {d['p2']}\n\n"
+        f"Сумма: <b>{amt:.2f} USDT</b>\n"
+        f"Нужно поставить на: <b>{'P1' if need_side == 1 else 'P2'}</b>"
+    )
+    photo_url = d.get("photo_url") or "https://via.placeholder.com/800x500.png?text=Fight"
+
+    # Важно: у InlineQueryResultPhoto НЕ используем поля 'description' (его нет).
+    result = InlineQueryResultPhoto(
+        id=str(deal_id),
+        photo_url=photo_url,
+        thumbnail_url=photo_url,
+        caption=caption,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_reply_link(deal_id, (await bot.me()).username),
+    )
+    await bot.answer_inline_query(iq.id, [result], cache_time=0, is_personal=True)
+
+# ===================== payments poller =====================
+async def payments_loop():
+    while True:
+        try:
+            ids = await db.pending_invoice_ids()
+            if ids:
+                invs = await cryptopay.get_invoices(ids)
+                inv_map = {}
+                for x in invs:
+                    if isinstance(x, dict):
+                        try:
+                            inv_map[int(x.get("invoice_id", 0))] = x
+                        except Exception:
+                            continue
+                for inv_id in ids:
+                    inv = inv_map.get(int(inv_id))
+                    if inv and inv.get("status") == "paid":
+                        iw = await db.get_invoice_wait(int(inv_id))
+                        if iw:
+                            payload = json.loads(iw["payload"])
+                            payer_tg = int(payload.get("tg_user_id"))
+                            user = await db.ensure_user_by_tg(payer_tg, None)
+                            if iw["kind"] == "NEW":
+                                await db.create_deal_after_paid(payload, int(inv_id), user["id"])
+                            elif iw["kind"] == "MATCH":
+                                await db.match_deal_after_paid(payload, int(inv_id), user["id"])
+                            await db.del_invoice_wait(int(inv_id))
+            await asyncio.sleep(6)
+        except Exception as e:
+            print(f"[payments_loop] tick error: {e!r}")
+            await asyncio.sleep(6)
+
+from aiogram.types import BotCommand
+
+async def set_bot_commands(bot: Bot):
+    commands = [
+        BotCommand(command="start", description="Главное меню"),
+    ]
+    await bot.set_my_commands(commands)
 
 async def main():
-    # гарантия, что таблицы есть (не обязательно, но удобно)
-    await db.init_db()
+    asyncio.create_task(payments_loop())
+    await set_bot_commands(bot)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-
-

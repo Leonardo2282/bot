@@ -1,37 +1,44 @@
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+
 from aiogram import Bot
-from aiogram.client.bot import DefaultBotProperties
-from aiogram.enums import ParseMode
-
 from .config import settings
-from .db import fetch
+from . import db
 
-async def run_once():
-    bot = Bot(settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    # бои, стартовавшие > 15 минут назад, без winner_participant
-    rows = await fetch(
-        "SELECT id, title, starts_at FROM fight "
-        "WHERE starts_at <= now() - interval '15 minutes' "
-        "AND winner_participant IS NULL "
-        "ORDER BY starts_at ASC LIMIT 20"
-    )
-    if not rows:
-        await bot.session.close()
-        return
-    text_lines = [f"#{r['id']} • <b>{r['title']}</b> — стартовал {r['starts_at']:%d.%m %H:%M}"]
-    text = "Нужно внести результат боя(ев):\n" + "\n".join(text_lines) + \
-           "\n\nИспользуй: <code>/admin_fight_result &lt;fight_id&gt; &lt;1|2&gt;</code>"
+BOT = Bot(settings.BOT_TOKEN)
 
-    for admin_id in settings.admin_ids:
+async def notify_admins(text: str):
+    for aid in settings.ADMIN_IDS:
         try:
-            await bot.send_message(admin_id, text)
+            await BOT.send_message(aid, text)
         except Exception:
             pass
-    await bot.session.close()
+
+async def loop():
+    while True:
+        try:
+            # Найти бои, у которых starts_at прошёл > 1 часа, а статус всё ещё не done
+            rows = await db.fetch("""
+                SELECT * FROM fight
+                WHERE (status IN ('upcoming','today','live'))
+                  AND starts_at IS NOT NULL
+                  AND starts_at < now() - interval '1 hour'
+                ORDER BY starts_at
+                LIMIT 20
+            """)
+            if rows:
+                for r in rows:
+                    await notify_admins(
+                        f"⚠️ Пора выставить результат по бою:\n<b>{r['title']}</b>\n"
+                        f"{r['participant1_name']} vs {r['participant2_name']}\n"
+                        f"ID: {r['id']}  (status={r['status']})"
+                    )
+            await asyncio.sleep(600)  # каждые 10 минут
+        except Exception:
+            await asyncio.sleep(600)
 
 async def main():
-    await run_once()
+    await loop()
 
 if __name__ == "__main__":
     asyncio.run(main())

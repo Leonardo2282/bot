@@ -1,37 +1,44 @@
-from typing import List, Optional
+# app/config.py  (Pydantic v2)
+from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import AnyUrl
+from pydantic import Field
+
 
 class Settings(BaseSettings):
     # Telegram
-    BOT_TOKEN: str
-    ADMINS_TG_IDS: str = ""   # "111,222"
+    BOT_TOKEN: str = Field(...)
+    ADMINS_TG_IDS: str = Field("", description="comma-separated tg ids")
 
-    # Crypto (можно не трогать сейчас)
-    CRYPTO_PAY_TOKEN: Optional[str] = None
-    CRYPTO_NETWORK: str = "MAIN_NET"
-    CRYPTO_DEFAULT_ASSET: str = "USDT"
+    # Crypto Pay
+    CRYPTO_PAY_TOKEN: str = Field(...)
+    CRYPTO_DEFAULT_ASSET: str = Field("USDT")
+    CRYPTO_NETWORK: str = Field("MAIN_NET")   # ← добавил
 
-    # Postgres
-    PGUSER: str = "sergey"
-    PGPASSWORD: str = ""
-    PGDATABASE: str = "bets"
-    PGHOST: str = "127.0.0.1"
-    PGPORT: int = 5432
+    # Комиссия
+    FEE_PCT: float = Field(0.10)
 
-    # Комиссии
-    FEE_PCT: float = 0.20
+    # PostgreSQL
+    PGUSER: str = Field(...)
+    PGPASSWORD: str = Field("")
+    PGDATABASE: str = Field(...)
+    PGHOST: str = Field("127.0.0.1")
+    PGPORT: int = Field(5432)
 
     # Google Sheets
-    GSHEET_CREDENTIALS_JSON: str = "service_account.json"
-    GSHEET_SPREADSHEET_ID: str = ""
-    GSHEET_RANGE: str = "Лист1!A2:G"
-
-    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
+    GSHEET_CREDENTIALS_JSON: str = Field("service_account.json")
+    GSHEET_SPREADSHEET_ID: str = Field(...)
+    GSHEET_WORKSHEET_NAME: str = Field("Лист"
+                                       "1")
+    GSHEET_RANGE: str = Field("Лист1!A2:G")   # ← добавил
+    MAIN_MENU_PHOTO_URL: str = Field("")
+    EVENTS_MENU_PHOTO_URL: str = Field("")
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
 
     @property
-    def admin_ids(self) -> List[int]:
+    def ADMIN_IDS(self) -> List[int]:
+        if not self.ADMINS_TG_IDS:
+            return []
         return [int(x.strip()) for x in self.ADMINS_TG_IDS.split(",") if x.strip()]
 
-settings = Settings()
 
+settings = Settings()
